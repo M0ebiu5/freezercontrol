@@ -128,11 +128,11 @@
     "type": "function",
     "z": "fc_tab",
     "name": "state update",
-    "func": "// Merges the latest temperature or power reading into global.freezers[<name>].\n// Temperature updates re-evaluate the decision synchronously so the outlet\n// reacts to the reading that pushed it over the ceiling. Power updates only\n// refresh state — they don't affect the decision and firing decide on each\n// would flood the status topic (HM publishes power every few seconds).\nconst name = msg.device_name;\nif (!name) return null;\nconst topic = msg.topic || '';\nconst freezers = global.get('freezers') || {};\nconst dev = freezers[name];\nif (!dev) return null;\nconst now = Date.now();\nlet trigger = null;\nif (topic.endsWith('/temperature')) {\n  dev.current_temp_c = Number(msg.payload);\n  dev.last_temp_update = now;\n  trigger = 'temp';\n} else if (topic.endsWith('/power')) {\n  dev.current_power_w = Number(msg.payload);\n  dev.last_power_update = now;\n}\nfreezers[name] = dev;\nglobal.set('freezers', freezers);\nif (trigger !== 'temp') return null;\nreturn { device_name: name, payload: dev, trigger: 'state_update' };",
+    "func": "// Merges the latest temperature or power reading into global.freezers[<name>]\n// and forwards a state-update message. The downstream delay node rate-limits\n// per device (msg.topic is set to the device name) so the HM freezer's\n// multi-hertz power stream doesn't flood fc_decide.\nconst name = msg.device_name;\nif (!name) return null;\nconst topic = msg.topic || '';\nconst freezers = global.get('freezers') || {};\nconst dev = freezers[name];\nif (!dev) return null;\nconst now = Date.now();\nlet trigger = null;\nif (topic.endsWith('/temperature')) {\n  dev.current_temp_c = Number(msg.payload);\n  dev.last_temp_update = now;\n  trigger = 'temp';\n} else if (topic.endsWith('/power')) {\n  dev.current_power_w = Number(msg.payload);\n  dev.last_power_update = now;\n  trigger = 'power';\n}\nfreezers[name] = dev;\nglobal.set('freezers', freezers);\nif (!trigger) return null;\nreturn { topic: name, device_name: name, payload: dev, trigger: 'state_update' };",
     "outputs": 1,
     "x": 620,
     "y": 220,
-    "wires": [["fc_decide"]]
+    "wires": [["fc_state_rate_limit"]]
   },
   {
     "id": "fc_eval_inject",
@@ -160,6 +160,27 @@
     "outputs": 1,
     "x": 380,
     "y": 420,
+    "wires": [["fc_decide"]]
+  },
+  {
+    "id": "fc_state_rate_limit",
+    "type": "delay",
+    "z": "fc_tab",
+    "name": "rate limit per device",
+    "pauseType": "queue",
+    "timeout": "5",
+    "timeoutUnits": "seconds",
+    "rate": "1",
+    "nbRateUnits": "15",
+    "rateUnits": "second",
+    "randomFirst": "1",
+    "randomLast": "5",
+    "randomUnits": "seconds",
+    "drop": false,
+    "allowrate": false,
+    "outputs": 1,
+    "x": 720,
+    "y": 220,
     "wires": [["fc_decide"]]
   },
   {
