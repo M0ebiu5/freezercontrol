@@ -172,6 +172,31 @@ const at = t => { Date.now = () => t; };
   const [, st] = decide(c, { device_name: 'freezer_kitchen', trigger: 'tick' });
   check('no reading -> keeps cooling', JSON.parse(st.payload).reason === 'no_reading' && JSON.parse(st.payload).state === 'cooling', st.payload);
 }
+{ // stale reading (sensor silent): fail-safe ON, even though the frozen value says "cold enough"
+  at(NOW);
+  const run = (extra, flowExtra = {}) => {
+    const c = ctx({ cfg: kitchenCfg(), freezers: { freezer_kitchen: dev({ current_temp_c: -22, ...extra }) }, pp: { price24: price24(NOW, 8, () => 30) } });
+    Object.assign(c.flow.v, flowExtra);
+    const [sw, st] = decide(c, { device_name: 'freezer_kitchen', trigger: 'tick' });
+    return { sw, st: JSON.parse(st.payload) };
+  };
+  const stale = run({ last_temp_update: NOW - 100 * MIN });
+  check('reading 100 min old -> ON stale_reading', stale.st.reason === 'stale_reading' && stale.st.state === 'cooling' && stale.sw && stale.sw.payload === 'ON' && stale.st.temp_age_min === 100, j(stale));
+  const fresh = run({ last_temp_update: NOW - 30 * MIN });
+  check('counter: reading 30 min old -> plans (off)', fresh.st.reason === 'plan_off' && fresh.st.temp_age_min === 30, j(fresh.st.reason));
+  const edge = run({ last_temp_update: NOW - 89 * MIN });
+  check('reading 89 min old -> not stale yet', edge.st.reason !== 'stale_reading', edge.st.reason);
+  const ovr = run({ last_temp_update: NOW - 100 * MIN, override: 'OFF' });
+  check('override OFF beats stale', ovr.st.reason === 'override_off' && ovr.sw.payload === 'OFF', j(ovr.st.reason));
+  const noTs = run({});
+  check('reading without timestamp (tests, old state) -> not stale', noTs.st.reason === 'plan_off', noTs.st.reason);
+  const off = run({ last_temp_update: NOW - 100 * MIN }, { config: kitchenCfg({ stale_temp_minutes: 0 }) });
+  check('stale_temp_minutes 0 disables the guard', off.st.reason === 'plan_off', off.st.reason);
+  const boot = run({ current_temp_c: null }, { started_at: NOW - 95 * MIN });
+  check('no reading 95 min after start -> ON stale_reading', boot.st.reason === 'stale_reading' && boot.sw.payload === 'ON', j(boot.st.reason));
+  const boot2 = run({ current_temp_c: null }, { started_at: NOW - 10 * MIN });
+  check('counter: no reading 10 min after start -> no_reading', boot2.st.reason === 'no_reading', boot2.st.reason);
+}
 Date.now = realNow;
 
 // ---- 3. real config + switch router ----
@@ -182,6 +207,7 @@ console.log('\nConfig and switch router');
   const cfg = c.flow.v.config;
   check('init: both freezers configured', j(Object.keys(cfg.freezers)) === j(['og_gefrierschrank', 'kg_kuehltruhe']), j(Object.keys(cfg.freezers)));
   check('init: state created for both', Object.keys(c.mem.v.freezers).length === 2 && c.mem.v.freezers.kg_kuehltruhe.state === 'idle');
+  check('init: stale_temp_minutes 90, started_at set', cfg.stale_temp_minutes === 90 && Math.abs(c.flow.v.started_at - Date.now()) < 5000, j([cfg.stale_temp_minutes, c.flow.v.started_at]));
   const route = (topic, payload) => routerFn({ topic, payload, reason: 'plan_off' }, c.flow, c.global, node);
   const og = route('home/freezer/og_gefrierschrank/set', 'OFF');
   check('OG OFF -> Tasmota event poweroff', og && og.topic === 'tm/cmnd/OgSpGfr/event' && og.payload === 'poweroff' && og._reason === 'plan_off', j(og));
