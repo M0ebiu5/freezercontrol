@@ -183,7 +183,17 @@ const at = t => { Date.now = () => t; };
   check('counter: reading 30 min old -> plans (off)', fresh.st.reason === 'plan_off' && fresh.st.temp_age_min === 30, j(fresh.st.reason));
   check('reading 89 min old -> not stale yet', run({ last_temp_update: NOW - 89 * MIN }).st.reason === 'plan_off');
   check('reading without timestamp -> ON stale_reading', on(run({ last_temp_update: null }), 'stale_reading'));
-  check('stale_temp_minutes 0 disables the age check', run({ last_temp_update: NOW - 100 * MIN }, { cfg: kitchenCfg({ stale_temp_minutes: 0 }) }).st.reason === 'plan_off');
+  const noAge = run({ last_temp_update: NOW - 100 * MIN }, { cfg: kitchenCfg({ stale_temp_minutes: 0 }) });
+  check('stale_temp_minutes 0 disables the age check (still aged: -22 + 0.03 x 100 = -19)', noAge.st.reason !== 'stale_reading' && noAge.st.temp_est_c === -19, j([noAge.st.reason, noAge.st.temp_est_c]));
+  // v0.16: aged estimate, stuck sensor, measurement time
+  const aged = run({ current_temp_c: -16.5, last_temp_update: NOW - 60 * MIN });
+  check('60 min old -16.5 degC -> T_est -14.7 over the -15 ceiling -> ON safety', aged.st.reason === 'safety_ceiling' && aged.st.temp_est_c === -14.7 && aged.sw.payload === 'ON', j([aged.st.reason, aged.st.temp_est_c]));
+  const agedFresh = run({ current_temp_c: -16.5 });
+  check('counter: fresh -16.5 degC -> no safety ceiling', agedFresh.st.reason !== 'safety_ceiling' && agedFresh.st.temp_est_c === -16.5, j(agedFresh.st.reason));
+  const stuck = run({ temp_changed_at: NOW - 200 * MIN });
+  check('value unchanged 200 min (reports keep coming) -> ON stuck_reading', on(stuck, 'stuck_reading') && stuck.st.temp_unchanged_min === 200, j(stuck.st.reason));
+  check('counter: unchanged 60 min -> plans', run({ temp_changed_at: NOW - 60 * MIN }).st.reason === 'plan_off');
+  check('stuck_temp_minutes 0 disables the stuck check', run({ temp_changed_at: NOW - 200 * MIN }, { cfg: kitchenCfg({ stuck_temp_minutes: 0 }) }).st.reason === 'plan_off');
   check('override OFF beats the fail-safe (explicit user choice)', run({ last_temp_update: NOW - 100 * MIN, override: 'OFF' }).sw.payload === 'OFF');
   check('no reading, idle (restart) -> ON no_reading', on(run({ state: 'idle', current_temp_c: null }), 'no_reading'));
   check('implausible -60 degC -> ON invalid_reading', on(run({ current_temp_c: -60 }), 'invalid_reading'));
@@ -209,7 +219,7 @@ console.log('\nConfig and switch router');
   const cfg = c.flow.v.config;
   check('init: both freezers configured', j(Object.keys(cfg.freezers)) === j(['og_gefrierschrank', 'kg_kuehltruhe']), j(Object.keys(cfg.freezers)));
   check('init: state created for both', Object.keys(c.mem.v.freezers).length === 2 && c.mem.v.freezers.kg_kuehltruhe.state === 'idle');
-  check('init: stale_temp_minutes 90', cfg.stale_temp_minutes === 90, j(cfg.stale_temp_minutes));
+  check('init: stale_temp_minutes 90, stuck_temp_minutes 180', cfg.stale_temp_minutes === 90 && cfg.stuck_temp_minutes === 180, j([cfg.stale_temp_minutes, cfg.stuck_temp_minutes]));
   const route = (topic, payload) => routerFn({ topic, payload, reason: 'plan_off' }, c.flow, c.global, node);
   const og = route('home/freezer/og_gefrierschrank/set', 'OFF');
   check('OG OFF -> Tasmota event poweroff', og && og.topic === 'tm/cmnd/OgSpGfr/event' && og.payload === 'poweroff' && og._reason === 'plan_off', j(og));
@@ -219,6 +229,28 @@ console.log('\nConfig and switch router');
   check('KG ON -> STATE true', on && on.topic === 'hm/set/HM-ES-PMSw1-Pl NEQ1809653:1/STATE' && on.payload === true, j(on));
   check('unknown freezer dropped with a warning', route('home/freezer/nope/set', 'OFF') === null && warns.some(w => /unknown freezer nope/.test(w)));
   check('other payloads dropped', route('home/freezer/kg_kuehltruhe/set', 'AUTO') === null);
+}
+
+// ---- 3b. fc_temp_parse + fc_state_update: measurement time, change tracking ----
+console.log('\nReading age (parse + state update)');
+{
+  const parseFn = compile('fc_temp_parse'), suFn = compile('fc_state_update');
+  const c = ctx({ freezers: {} });
+  initFn({}, c.flow, c.global, node);
+  const T0 = Date.now();
+  const feed = (value, tst) => {
+    const m = parseFn({ topic: 'sensor/status/temperature/og_speis/ht/4', payload: { value, tst } }, c.flow, c.global, node);
+    return suFn(m, c.flow, c.global, node);
+  };
+  feed(-19.4, new Date(T0 - 30 * MIN).toISOString());
+  let d = c.mem.v.freezers.og_gefrierschrank;
+  check('age counts from payload tst (30 min old message)', Math.abs(d.last_temp_update - (T0 - 30 * MIN)) < 1000 && Math.abs(d.temp_changed_at - (T0 - 30 * MIN)) < 1000, j([d.last_temp_update - T0]));
+  feed(-19.4, new Date(T0 + 3600e3).toISOString());
+  d = c.mem.v.freezers.og_gefrierschrank;
+  check('tst in the future -> arrival time; same value keeps temp_changed_at', Math.abs(d.last_temp_update - Date.now()) < 1000 && Math.abs(d.temp_changed_at - (T0 - 30 * MIN)) < 1000);
+  feed(-19.3, 'garbage');
+  d = c.mem.v.freezers.og_gefrierschrank;
+  check('invalid tst -> arrival time; new value moves temp_changed_at', Math.abs(d.last_temp_update - Date.now()) < 1000 && Math.abs(d.temp_changed_at - Date.now()) < 1000);
 }
 
 // ---- 4. error fail-safe (fc_catch -> fc_failsafe_fn) ----
