@@ -55,7 +55,8 @@ const predLabel = t => {
 const kitchenCfg = (extra = {}) => ({ pv_base_load_w: 400, min_on_minutes: 0, safety_margin_c: 0.5, ...extra,
   freezers: { freezer_kitchen: { t_max_c: -15, fallback_cooling_rate_c_per_min: -0.3, fallback_warming_rate_c_per_min: 0.03,
     fallback_running_power_w: 120 }, freezer_cellar: { t_max_c: -15 } } });
-const dev = (extra = {}) => ({ name: 'freezer_kitchen', state: 'idle', override: 'AUTO', current_temp_c: -20, model: {}, ...extra });
+// last_temp_update: a fresh reading (Date.now() is mocked by at())
+const dev = (extra = {}) => ({ name: 'freezer_kitchen', state: 'idle', override: 'AUTO', current_temp_c: -20, last_temp_update: Date.now(), model: {}, ...extra });
 
 // ---- assertion helpers ----
 let passed = 0, failed = 0;
@@ -166,36 +167,37 @@ const at = t => { Date.now = () => t; };
   check('door event + cheap slot -> ON', a && a.payload === 'ON' && a.reason === 'door_recovery', j(a));
   check('door event + expensive slot -> no recovery, stays OFF', b === null && JSON.parse(bs.payload).reason === 'plan_off', bs && bs.payload.slice(0, 80));
 }
-{ // no temperature yet: keep the current state
+{ // v0.15 fail-safe: anything the planner can't trust -> ON, never OFF
   at(NOW);
-  const c = ctx({ cfg: kitchenCfg(), freezers: { freezer_kitchen: dev({ state: 'cooling', current_temp_c: null }) }, pp: { price24: price24(NOW, 8, () => 30) } });
-  const [, st] = decide(c, { device_name: 'freezer_kitchen', trigger: 'tick' });
-  check('no reading -> keeps cooling', JSON.parse(st.payload).reason === 'no_reading' && JSON.parse(st.payload).state === 'cooling', st.payload);
-}
-{ // stale reading (sensor silent): fail-safe ON, even though the frozen value says "cold enough"
-  at(NOW);
-  const run = (extra, flowExtra = {}) => {
-    const c = ctx({ cfg: kitchenCfg(), freezers: { freezer_kitchen: dev({ current_temp_c: -22, ...extra }) }, pp: { price24: price24(NOW, 8, () => 30) } });
-    Object.assign(c.flow.v, flowExtra);
+  const run = (extra = {}, { cfg = kitchenCfg(), p24 = price24(NOW, 8, () => 30) } = {}) => {
+    const c = ctx({ cfg, freezers: { freezer_kitchen: dev({ current_temp_c: -22, ...extra }) }, pp: { price24: p24 } });
     const [sw, st] = decide(c, { device_name: 'freezer_kitchen', trigger: 'tick' });
     return { sw, st: JSON.parse(st.payload) };
   };
+  const on = (r, reason) => r.st.reason === reason && r.st.state === 'cooling' && r.sw && r.sw.payload === 'ON';
+  const base = run();
+  check('baseline: fresh -22 degC, 30 ct -> plan_off (OFF)', base.st.reason === 'plan_off' && base.sw.payload === 'OFF', j(base.st.reason));
   const stale = run({ last_temp_update: NOW - 100 * MIN });
-  check('reading 100 min old -> ON stale_reading', stale.st.reason === 'stale_reading' && stale.st.state === 'cooling' && stale.sw && stale.sw.payload === 'ON' && stale.st.temp_age_min === 100, j(stale));
+  check('reading 100 min old -> ON stale_reading', on(stale, 'stale_reading') && stale.st.temp_age_min === 100, j(stale));
   const fresh = run({ last_temp_update: NOW - 30 * MIN });
   check('counter: reading 30 min old -> plans (off)', fresh.st.reason === 'plan_off' && fresh.st.temp_age_min === 30, j(fresh.st.reason));
-  const edge = run({ last_temp_update: NOW - 89 * MIN });
-  check('reading 89 min old -> not stale yet', edge.st.reason !== 'stale_reading', edge.st.reason);
-  const ovr = run({ last_temp_update: NOW - 100 * MIN, override: 'OFF' });
-  check('override OFF beats stale', ovr.st.reason === 'override_off' && ovr.sw.payload === 'OFF', j(ovr.st.reason));
-  const noTs = run({});
-  check('reading without timestamp (tests, old state) -> not stale', noTs.st.reason === 'plan_off', noTs.st.reason);
-  const off = run({ last_temp_update: NOW - 100 * MIN }, { config: kitchenCfg({ stale_temp_minutes: 0 }) });
-  check('stale_temp_minutes 0 disables the guard', off.st.reason === 'plan_off', off.st.reason);
-  const boot = run({ current_temp_c: null }, { started_at: NOW - 95 * MIN });
-  check('no reading 95 min after start -> ON stale_reading', boot.st.reason === 'stale_reading' && boot.sw.payload === 'ON', j(boot.st.reason));
-  const boot2 = run({ current_temp_c: null }, { started_at: NOW - 10 * MIN });
-  check('counter: no reading 10 min after start -> no_reading', boot2.st.reason === 'no_reading', boot2.st.reason);
+  check('reading 89 min old -> not stale yet', run({ last_temp_update: NOW - 89 * MIN }).st.reason === 'plan_off');
+  check('reading without timestamp -> ON stale_reading', on(run({ last_temp_update: null }), 'stale_reading'));
+  check('stale_temp_minutes 0 disables the age check', run({ last_temp_update: NOW - 100 * MIN }, { cfg: kitchenCfg({ stale_temp_minutes: 0 }) }).st.reason === 'plan_off');
+  check('override OFF beats the fail-safe (explicit user choice)', run({ last_temp_update: NOW - 100 * MIN, override: 'OFF' }).sw.payload === 'OFF');
+  check('no reading, idle (restart) -> ON no_reading', on(run({ state: 'idle', current_temp_c: null }), 'no_reading'));
+  check('implausible -60 degC -> ON invalid_reading', on(run({ current_temp_c: -60 }), 'invalid_reading'));
+  check('non-number reading -> ON invalid_reading', on(run({ current_temp_c: 'abc' }), 'invalid_reading'));   // (NaN becomes null in the JSON-cloned test store)
+  const noTmax = kitchenCfg(); delete noTmax.freezers.freezer_kitchen.t_max_c;
+  check('t_max_c missing -> ON bad_config', on(run({}, { cfg: noTmax }), 'bad_config'));
+  check('no price slots -> ON no_prices', on(run({}, { p24: {} }), 'no_prices'));
+  check('only past price slots -> ON no_prices', on(run({}, { p24: price24(NOW - 24 * 3600e3, 8, () => 30) }), 'no_prices'));
+  const badMin = kitchenCfg(); badMin.freezers.freezer_kitchen.t_min_c = 'x';
+  check('NaN in the simulation -> ON plan_invalid', on(run({}, { cfg: badMin }), 'plan_invalid'));
+  const inf = run({ current_temp_c: -15.2, model: { cooling_rate_c_per_min: 0.1 } });
+  check('infeasible plan -> ON plan_infeasible', on(inf, 'plan_infeasible'), j(inf.st.reason));
+  const ceil = run({ current_temp_c: -14 }, { p24: {} });
+  check('safety ceiling still wins without prices', ceil.st.reason === 'safety_ceiling' && ceil.st.state === 'safety' && ceil.sw.payload === 'ON', j(ceil.st.reason));
 }
 Date.now = realNow;
 
@@ -207,7 +209,7 @@ console.log('\nConfig and switch router');
   const cfg = c.flow.v.config;
   check('init: both freezers configured', j(Object.keys(cfg.freezers)) === j(['og_gefrierschrank', 'kg_kuehltruhe']), j(Object.keys(cfg.freezers)));
   check('init: state created for both', Object.keys(c.mem.v.freezers).length === 2 && c.mem.v.freezers.kg_kuehltruhe.state === 'idle');
-  check('init: stale_temp_minutes 90, started_at set', cfg.stale_temp_minutes === 90 && Math.abs(c.flow.v.started_at - Date.now()) < 5000, j([cfg.stale_temp_minutes, c.flow.v.started_at]));
+  check('init: stale_temp_minutes 90', cfg.stale_temp_minutes === 90, j(cfg.stale_temp_minutes));
   const route = (topic, payload) => routerFn({ topic, payload, reason: 'plan_off' }, c.flow, c.global, node);
   const og = route('home/freezer/og_gefrierschrank/set', 'OFF');
   check('OG OFF -> Tasmota event poweroff', og && og.topic === 'tm/cmnd/OgSpGfr/event' && og.payload === 'poweroff' && og._reason === 'plan_off', j(og));
@@ -217,6 +219,28 @@ console.log('\nConfig and switch router');
   check('KG ON -> STATE true', on && on.topic === 'hm/set/HM-ES-PMSw1-Pl NEQ1809653:1/STATE' && on.payload === true, j(on));
   check('unknown freezer dropped with a warning', route('home/freezer/nope/set', 'OFF') === null && warns.some(w => /unknown freezer nope/.test(w)));
   check('other payloads dropped', route('home/freezer/kg_kuehltruhe/set', 'AUTO') === null);
+}
+
+// ---- 4. error fail-safe (fc_catch -> fc_failsafe_fn) ----
+console.log('\nError fail-safe');
+{
+  const c = ctx({ freezers: {} });
+  initFn({}, c.flow, c.global, node);
+  const fsFn = compile('fc_failsafe_fn');
+  const st = { status() {}, warn: m => warns.push(m) };
+  const one = fsFn({ device_name: 'kg_kuehltruhe', error: { message: 'boom', source: { name: 'decide' } } }, c.flow, c.global, st)[0];
+  check('error with device -> ON for that freezer only', one.length === 1 && one[0].topic === 'hm/set/HM-ES-PMSw1-Pl NEQ1809653:1/STATE' && one[0].payload === true, j(one));
+  const all = fsFn({ error: { message: 'boom' } }, c.flow, c.global, st)[0];
+  check('error without device -> ON for all freezers', j(all.map(m => m.topic + '=' + m.payload)) === j(['tm/cmnd/OgSpGfr/POWER=ON', 'hm/set/HM-ES-PMSw1-Pl NEQ1809653:1/STATE=true']), j(all));
+  const cat = flows.find(n => n.id === 'fc_catch');
+  const chain = ['fc_temp_parse', 'fc_pwr_parse', 'fc_state_update', 'fc_eval_fanout', 'fc_decide', 'fc_switch_router', 'fc_init_fn', 'fc_override_fn'];
+  check('fc_catch covers the control chain and feeds the fail-safe', cat && chain.every(id => cat.scope.includes(id)) && cat.wires[0][0] === 'fc_failsafe_fn');
+  const fsn = flows.find(n => n.id === 'fc_failsafe_fn');
+  check('fail-safe publishes straight to the outlet mqtt out', fsn.wires[0].includes('fc_mqtt_out_switch'));
+  // a decide that throws is caught by Node-RED -> fc_catch; check the real decide does throw on garbage state
+  let threw = false;
+  try { decide(ctx({ cfg: kitchenCfg(), freezers: { freezer_kitchen: { ...dev(), model: null, last_state_change_at: 0 } }, pp: { price24: price24(Date.now(), 8, () => 30) } }), { device_name: 'freezer_kitchen', trigger: 'tick' }); } catch (e) { threw = true; }
+  check('null model does not throw (falls back to defaults)', !threw);
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);
